@@ -6,10 +6,19 @@ Documentation=https://github.com/iliya-Developer/VortexL2
 
 [Service]
 Type=oneshot
+# Load required kernel modules before starting
+ExecStartPre=/sbin/modprobe l2tp_core
+ExecStartPre=/sbin/modprobe l2tp_netlink
+ExecStartPre=/sbin/modprobe l2tp_eth
+# Small delay to ensure network is fully ready
+ExecStartPre=/bin/sleep 2
 ExecStart=/usr/local/bin/vortexl2 apply
 RemainAfterExit=yes
 StandardOutput=journal
 StandardError=journal
+# Restart on failure
+Restart=on-failure
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
