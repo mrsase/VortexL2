@@ -21,7 +21,7 @@ BIN_PATH="/usr/local/bin/vortexl2"
 SYSTEMD_DIR="/etc/systemd/system"
 CONFIG_DIR="/etc/vortexl2"
 REPO_URL="https://github.com/iliya-Developer/VortexL2.git"
-REPO_BRANCH="feature/wireguard-encryption-layer"
+REPO_BRANCH="main"
 
 echo -e "${CYAN}"
 cat << 'EOF'
