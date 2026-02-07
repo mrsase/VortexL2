@@ -3,7 +3,7 @@
 # VortexL2 Installer
 # L2TPv3 Tunnel Manager for Ubuntu/Debian
 #
-# Usage: curl -fsSL https://raw.githubusercontent.com/iliya-Developer/VortexL2/main/install.sh | sudo bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/mrsase/VortexL2/main/install.sh | sudo bash
 #
 
 set -e
@@ -20,7 +20,7 @@ INSTALL_DIR="/opt/vortexl2"
 BIN_PATH="/usr/local/bin/vortexl2"
 SYSTEMD_DIR="/etc/systemd/system"
 CONFIG_DIR="/etc/vortexl2"
-REPO_URL="https://github.com/iliya-Developer/VortexL2.git"
+REPO_URL="https://github.com/mrsase/VortexL2.git"
 REPO_BRANCH="main"
 
 echo -e "${CYAN}"
@@ -87,12 +87,12 @@ if command -v git &> /dev/null; then
         echo -e "${YELLOW}Git clone failed, trying manual download...${NC}"
         mkdir -p "$INSTALL_DIR"
         # If git fails, try downloading as archive
-        curl -fsSL "https://github.com/iliya-Developer/VortexL2/archive/refs/heads/${REPO_BRANCH}.tar.gz" | \
+        curl -fsSL "https://github.com/mrsase/VortexL2/archive/refs/heads/${REPO_BRANCH}.tar.gz" | \
             tar -xz -C "$INSTALL_DIR" --strip-components=1
     }
 else
     mkdir -p "$INSTALL_DIR"
-    curl -fsSL "https://github.com/iliya-Developer/VortexL2/archive/refs/heads/${REPO_BRANCH}.tar.gz" | \
+    curl -fsSL "https://github.com/mrsase/VortexL2/archive/refs/heads/${REPO_BRANCH}.tar.gz" | \
         tar -xz -C "$INSTALL_DIR" --strip-components=1
 fi
 
