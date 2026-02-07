@@ -66,10 +66,47 @@ class SocatManager:
             return f"{proc_name} (PID: {pid})"
         return None
 
-    def start_forward(self, local_port: int, remote_ip: str, remote_port: int) -> Tuple[bool, str]:
-        """Start socat forward for a single port."""
-        import time
+    def _get_service_name(self, port: int) -> str:
+        """Get systemd service name for a port."""
+        return f"vortexl2-socat-{port}"
+    
+    def _get_service_path(self, port: int) -> str:
+        """Get systemd service file path."""
+        return f"/etc/systemd/system/{self._get_service_name(port)}.service"
+    
+    def _create_service_file(self, local_port: int, remote_ip: str, remote_port: int) -> Tuple[bool, str]:
+        """Create systemd service file for socat port forward."""
+        service_name = self._get_service_name(local_port)
+        service_content = f"""[Unit]
+Description=VortexL2 Socat Port Forward {local_port}
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat TCP-LISTEN:{local_port},fork,reuseaddr TCP:{remote_ip}:{remote_port}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+"""
+        try:
+            with open(self._get_service_path(local_port), 'w') as f:
+                f.write(service_content)
+            return True, f"Service file created: {service_name}"
+        except Exception as e:
+            return False, f"Failed to create service file: {e}"
+    
+    def _remove_service_file(self, port: int) -> None:
+        """Remove systemd service file."""
         import os
+        service_path = self._get_service_path(port)
+        if os.path.exists(service_path):
+            os.remove(service_path)
+
+    def start_forward(self, local_port: int, remote_ip: str, remote_port: int) -> Tuple[bool, str]:
+        """Start socat forward for a single port using systemd service."""
+        import time
         
         if not self.check_socat_installed():
             return False, "socat is not installed. Install with: apt-get install socat"
@@ -79,98 +116,62 @@ class SocatManager:
             proc = self._get_port_process(local_port)
             return False, f"Port {local_port} is already in use by: {proc or 'unknown process'}"
         
-        # Build socat command as a list for Popen
-        socat_cmd = [
-            "socat",
-            f"TCP-LISTEN:{local_port},fork,reuseaddr",
-            f"TCP:{remote_ip}:{remote_port}"
-        ]
+        service_name = self._get_service_name(local_port)
         
-        try:
-            # Use Popen to spawn socat as a proper background process
-            # stdout/stderr go to /dev/null, but we capture startup errors first
-            log_file = f"/tmp/socat_{local_port}.log"
-            with open(log_file, 'w') as log_f:
-                process = subprocess.Popen(
-                    socat_cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=log_f,
-                    stdin=subprocess.DEVNULL,
-                    start_new_session=True  # Detach from parent process group
-                )
-            
-            # Wait a bit for socat to start listening
-            max_wait = 1.5  # seconds
-            wait_interval = 0.2
-            waited = 0
-            while waited < max_wait:
-                time.sleep(wait_interval)
-                waited += wait_interval
-                
-                # Check if process died
-                if process.poll() is not None:
-                    # Process exited - read error log
-                    try:
-                        with open(log_file, 'r') as f:
-                            error_msg = f.read().strip()
-                        os.unlink(log_file)
-                    except Exception:
-                        error_msg = "Unknown error"
-                    return False, f"Socat exited immediately: {error_msg or 'check port/IP validity'}"
-                
-                # Check if port is now listening
-                if self._is_port_listening(local_port):
-                    # Clean up log file on success
-                    try:
-                        os.unlink(log_file)
-                    except Exception:
-                        pass
-                    return True, f"Socat forward started: {local_port} → {remote_ip}:{remote_port}"
-            
-            # Timeout waiting for port - check if process is still alive
-            if process.poll() is None:
-                # Process is running but port not listening yet - give it more time
-                time.sleep(0.5)
-                if self._is_port_listening(local_port):
-                    try:
-                        os.unlink(log_file)
-                    except Exception:
-                        pass
-                    return True, f"Socat forward started: {local_port} → {remote_ip}:{remote_port}"
-                # Still not listening - kill and report
-                process.terminate()
-                return False, f"Socat started but port {local_port} not listening (check network/firewall)"
-            else:
-                # Process died during wait
-                try:
-                    with open(log_file, 'r') as f:
-                        error_msg = f.read().strip()
-                    os.unlink(log_file)
-                except Exception:
-                    error_msg = "Unknown error"
-                return False, f"Socat failed to start: {error_msg or 'unknown error'}"
-                
-        except FileNotFoundError:
-            return False, "socat binary not found in PATH"
-        except Exception as e:
-            return False, f"Failed to start socat: {str(e)}"
+        # Create service file
+        success, msg = self._create_service_file(local_port, remote_ip, remote_port)
+        if not success:
+            return False, msg
+        
+        # Reload systemd and start service
+        run_command("systemctl daemon-reload")
+        success, stdout, stderr = run_command(f"systemctl start {service_name}")
+        
+        if not success:
+            self._remove_service_file(local_port)
+            return False, f"Failed to start service: {stderr}"
+        
+        # Verify port is listening
+        time.sleep(0.5)
+        if self._is_port_listening(local_port):
+            # Enable for auto-start
+            run_command(f"systemctl enable {service_name}")
+            return True, f"Socat forward started: {local_port} → {remote_ip}:{remote_port}"
+        else:
+            # Check service status for error
+            _, status_out, _ = run_command(f"systemctl status {service_name}")
+            run_command(f"systemctl stop {service_name}")
+            run_command(f"systemctl disable {service_name}")
+            self._remove_service_file(local_port)
+            return False, f"Socat service started but port not listening. Status: {status_out[:200] if status_out else 'unknown'}"
     
     def stop_forward(self, local_port: int) -> Tuple[bool, str]:
         """Stop socat forward for a specific port."""
-        if not self._is_port_listening(local_port):
-            return True, f"Port {local_port} is not being forwarded"
+        import time
+        import os
         
-        # Kill socat process listening on this port
-        # Using pkill with full command matching carefully
-        cmd = f"pkill -f 'socat.*TCP-LISTEN:{local_port}[^0-9]'"
-        run_command(cmd)
+        service_name = self._get_service_name(local_port)
+        service_path = self._get_service_path(local_port)
+        
+        # Stop and disable service
+        run_command(f"systemctl stop {service_name}")
+        run_command(f"systemctl disable {service_name}")
+        
+        # Remove service file
+        self._remove_service_file(local_port)
+        run_command("systemctl daemon-reload")
         
         # Verify it stopped
-        import time
-        time.sleep(0.5)
+        time.sleep(0.3)
         if not self._is_port_listening(local_port):
             return True, f"Stopped socat forward on port {local_port}"
         else:
+            # Fallback: kill directly
+            cmd = f"pkill -f 'socat.*TCP-LISTEN:{local_port}[^0-9]'"
+            run_command(cmd)
+            time.sleep(0.3)
+            if not self._is_port_listening(local_port):
+                return True, f"Stopped socat forward on port {local_port} (forced)"
             return False, f"Failed to stop socat on port {local_port}"
 
     # -- HAProxyManager Interface Compatibility --
@@ -340,34 +341,51 @@ class SocatManager:
 
     async def stop_all_forwards(self) -> Tuple[bool, str]:
         """Stop all socat forwards (Async wrapper)."""
-        # 1. Kill all socat processes gracefully first
+        import time
+        import glob
+        import os
+        
+        stopped_count = 0
+        
+        # 1. Stop all vortexl2-socat-* systemd services
+        # List all service files
+        service_pattern = "/etc/systemd/system/vortexl2-socat-*.service"
+        service_files = glob.glob(service_pattern)
+        
+        for service_file in service_files:
+            service_name = os.path.basename(service_file).replace('.service', '')
+            run_command(f"systemctl stop {service_name}")
+            run_command(f"systemctl disable {service_name}")
+            try:
+                os.remove(service_file)
+                stopped_count += 1
+            except Exception:
+                pass
+        
+        if service_files:
+            run_command("systemctl daemon-reload")
+        
+        # 2. Kill any stray socat processes (fallback)
         cmd = "pkill -f 'socat.*TCP-LISTEN'"
         run_command(cmd)
         
-        # 2. Wait for them to exit
-        wait_steps = 5
-        for _ in range(wait_steps):
-            import time
-            time.sleep(0.2)
-            running_pids = self._get_running_socat_pids()
-            if not running_pids:
-                return True, "All socat forwards stopped"
-        
-        # 3. Force kill specific PIDs if still running (avoiding pkill -9 matching too broadly)
+        # 3. Wait for them to exit
+        time.sleep(0.5)
         running_pids = self._get_running_socat_pids()
+        
         if running_pids:
+            # Force kill remaining
             pids_str = " ".join(running_pids)
             run_command(f"kill -9 {pids_str}")
+            time.sleep(0.3)
             
-            import time
-            time.sleep(0.5)
-            
-            # 4. Final Verification
             final_pids = self._get_running_socat_pids()
             if final_pids:
-                 return False, f"Some socat processes failed to stop (PIDs: {final_pids})"
-             
-        return True, "All socat forwards stopped (forced)"
+                return False, f"Some socat processes failed to stop (PIDs: {final_pids})"
+        
+        if stopped_count > 0:
+            return True, f"Stopped {stopped_count} socat services"
+        return True, "All socat forwards stopped"
 
 
     async def restart_all_forwards(self) -> Tuple[bool, str]:
