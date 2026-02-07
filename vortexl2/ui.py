@@ -172,7 +172,9 @@ def show_main_menu() -> str:
         ("3", "Delete Tunnel"),
         ("4", "List Tunnels"),
         ("5", "Port Forwards"),
-        ("6", "View Logs"),
+        ("6", "Manage Secure Encryption (WireGuard)"),
+        ("7", "Bandwidth & Performance Monitor"),
+        ("8", "View Logs"),
         ("0", "Exit"),
     ]
     
@@ -583,6 +585,7 @@ def show_forwards_list(forwards: list):
     table = Table(title="Port Forwards", box=box.ROUNDED)
     table.add_column("Port", style="cyan", justify="right")
     table.add_column("Remote Target", style="white")
+    table.add_column("Encryption", style="white")
     table.add_column("Status", style="white")
     table.add_column("Sessions", style="white")
     
@@ -605,9 +608,13 @@ def show_forwards_list(forwards: list):
             status_style = "green" if status == "active" else "red"
             sessions = "-"
         
+        encrypted = fwd.get("encrypted", False)
+        enc_label = "[green]WireGuard[/]" if encrypted else "[dim]Direct[/]"
+        
         table.add_row(
             str(fwd["port"]),
             fwd.get("remote", "-"),
+            enc_label,
             f"[{status_style}]{status}[/]",
             sessions
         )
@@ -629,3 +636,374 @@ def wait_for_enter():
 def confirm(message: str, default: bool = False) -> bool:
     """Ask for confirmation."""
     return Confirm.ask(message, default=default)
+
+
+def show_wireguard_menu() -> str:
+    """Display WireGuard encryption submenu."""
+    menu_items = [
+        ("1", "Install/Enable Secure Layer"),
+        ("2", "Disable Secure Layer"),
+        ("3", "View Status/Keys"),
+        ("0", "Back to Main Menu"),
+    ]
+
+    table = Table(show_header=False, box=box.SIMPLE, padding=(0, 2))
+    table.add_column("Option", style="bold cyan", width=4)
+    table.add_column("Description", style="white")
+
+    for opt, desc in menu_items:
+        table.add_row(f"[{opt}]", desc)
+
+    console.print(Panel(table, title="[bold white]Secure Encryption (WireGuard)[/]", border_style="magenta"))
+
+    return Prompt.ask("\n[bold cyan]Select option[/]", default="0")
+
+
+def show_wireguard_status(status: dict):
+    """Display WireGuard status in a rich table."""
+    table = Table(title="WireGuard Status", box=box.ROUNDED)
+    table.add_column("Property", style="cyan", width=22)
+    table.add_column("Value", style="white")
+
+    installed = status.get("installed", False)
+    iface_up = status.get("interface_up", False)
+
+    table.add_row("Installed", "[green]Yes[/]" if installed else "[red]No[/]")
+    table.add_row("Interface (wg_vortex)", "[green]UP[/]" if iface_up else "[red]DOWN[/]")
+    table.add_row("WireGuard IP", status.get("wg_ip") or "-")
+    table.add_row("Listen Port", str(status.get("listen_port") or "-"))
+    table.add_row("Public Key", status.get("public_key") or "-")
+    table.add_row("Peer Public Key", status.get("peer_public_key") or "-")
+    table.add_row("Peer Endpoint", status.get("peer_endpoint") or "-")
+    table.add_row("Latest Handshake", status.get("latest_handshake") or "-")
+    table.add_row("Transfer RX", status.get("transfer_rx", "0 B"))
+    table.add_row("Transfer TX", status.get("transfer_tx", "0 B"))
+    table.add_row("BBR Enabled", "[green]Yes[/]" if status.get("bbr_enabled") else "[red]No[/]")
+
+    console.print(table)
+
+    # Show public key prominently for easy sharing
+    pub = status.get("public_key")
+    if pub:
+        console.print(Panel(
+            f"[bold green]{pub}[/]",
+            title="[bold white]Your Public Key (share with peer)[/]",
+            border_style="green",
+            box=box.ROUNDED
+        ))
+
+
+def prompt_peer_public_key() -> Optional[str]:
+    """Prompt user to paste the remote peer's WireGuard public key."""
+    console.print("\n[dim]Paste the WireGuard public key from the OTHER server.[/]")
+    console.print("[dim]You can get it by running option 3 (View Status/Keys) on the peer.[/]")
+    key = Prompt.ask("[bold magenta]Peer Public Key[/]")
+    if key and len(key.strip()) >= 40:
+        return key.strip()
+    console.print("[red]Invalid key. A WireGuard public key is a 44-character base64 string.[/]")
+    return None
+
+
+def show_bandwidth_menu() -> str:
+    """Display bandwidth monitor submenu."""
+    menu_items = [
+        ("1", "Live Monitor (real-time bandwidth)"),
+        ("2", "Snapshot (one-time stats)"),
+        ("3", "Performance Analysis (bottleneck detection)"),
+        ("4", "Auto-Optimize (apply TCP/network fixes)"),
+        ("5", "Setup DNS Cache"),
+        ("0", "Back to Main Menu"),
+    ]
+
+    table = Table(show_header=False, box=box.SIMPLE, padding=(0, 2))
+    table.add_column("Option", style="bold cyan", width=4)
+    table.add_column("Description", style="white")
+
+    for opt, desc in menu_items:
+        table.add_row(f"[{opt}]", desc)
+
+    console.print(Panel(table, title="[bold white]Bandwidth & Performance Monitor[/]", border_style="yellow"))
+
+    return Prompt.ask("\n[bold cyan]Select option[/]", default="0")
+
+
+def show_bandwidth_live(bandwidth: dict, elapsed: int = 0):
+    """
+    Build and return a Rich Table for the live bandwidth display.
+    bandwidth has keys: l2tp, wireguard, ports
+    """
+    from .bandwidth_monitor import _fmt_speed, _fmt_bytes
+
+    table = Table(
+        title=f"Live Bandwidth Monitor (elapsed: {elapsed}s — Ctrl+C to stop)",
+        box=box.ROUNDED,
+        title_style="bold yellow",
+    )
+    table.add_column("Layer", style="bold white", width=18)
+    table.add_column("▼ RX", style="green", justify="right", width=14)
+    table.add_column("▲ TX", style="cyan", justify="right", width=14)
+    table.add_column("Total RX", style="dim green", justify="right", width=12)
+    table.add_column("Total TX", style="dim cyan", justify="right", width=12)
+    table.add_column("Errors", style="red", justify="right", width=8)
+    table.add_column("Drops", style="red", justify="right", width=8)
+
+    # L2TP layer
+    for iface, stats in bandwidth.get("l2tp", {}).items():
+        table.add_row(
+            f"L2TP ({iface})",
+            _fmt_speed(stats.get("rx_bps", 0)),
+            _fmt_speed(stats.get("tx_bps", 0)),
+            _fmt_bytes(stats.get("rx_bytes_total", 0)),
+            _fmt_bytes(stats.get("tx_bytes_total", 0)),
+            str(stats.get("rx_errors", 0) + stats.get("tx_errors", 0)),
+            str(stats.get("rx_dropped", 0) + stats.get("tx_dropped", 0)),
+        )
+
+    # WireGuard layer
+    wg = bandwidth.get("wireguard")
+    if wg:
+        table.add_row(
+            "WireGuard (wg_vortex)",
+            _fmt_speed(wg.get("rx_bps", 0)),
+            _fmt_speed(wg.get("tx_bps", 0)),
+            _fmt_bytes(wg.get("rx_bytes_total", 0)),
+            _fmt_bytes(wg.get("tx_bytes_total", 0)),
+            str(wg.get("rx_errors", 0) + wg.get("tx_errors", 0)),
+            str(wg.get("rx_dropped", 0) + wg.get("tx_dropped", 0)),
+        )
+    else:
+        table.add_row("WireGuard", "[dim]-[/]", "[dim]-[/]", "[dim]-[/]", "[dim]-[/]", "-", "-")
+
+    # Separator
+    table.add_row("", "", "", "", "", "", "", style="dim")
+
+    # Per-port layer
+    for port, stats in sorted(bandwidth.get("ports", {}).items()):
+        table.add_row(
+            f"Port {port}",
+            _fmt_speed(stats.get("rx_bps", 0)),
+            _fmt_speed(stats.get("tx_bps", 0)),
+            _fmt_bytes(stats.get("rx_bytes_total", 0)),
+            _fmt_bytes(stats.get("tx_bytes_total", 0)),
+            "-",
+            "-",
+        )
+
+    if not bandwidth.get("ports"):
+        table.add_row("Ports", "[dim]no accounting[/]", "[dim]-[/]", "[dim]-[/]", "[dim]-[/]", "-", "-")
+
+    return table
+
+
+def show_snapshot(stats: dict):
+    """Display a one-time snapshot of all layer statistics."""
+    from .bandwidth_monitor import _fmt_bytes
+
+    table = Table(title="Layer Statistics Snapshot", box=box.ROUNDED)
+    table.add_column("Layer", style="bold white", width=18)
+    table.add_column("RX Bytes", style="green", justify="right", width=14)
+    table.add_column("TX Bytes", style="cyan", justify="right", width=14)
+    table.add_column("RX Packets", style="dim green", justify="right", width=12)
+    table.add_column("TX Packets", style="dim cyan", justify="right", width=12)
+    table.add_column("Errors", style="red", justify="right", width=8)
+    table.add_column("Drops", style="red", justify="right", width=8)
+
+    # L2TP
+    for iface, s in stats.get("l2tp", {}).items():
+        table.add_row(
+            f"L2TP ({iface})",
+            _fmt_bytes(s["rx_bytes"]), _fmt_bytes(s["tx_bytes"]),
+            str(s["rx_packets"]), str(s["tx_packets"]),
+            str(s["rx_errors"] + s["tx_errors"]),
+            str(s["rx_dropped"] + s["tx_dropped"]),
+        )
+
+    # WireGuard
+    wg = stats.get("wireguard")
+    if wg:
+        table.add_row(
+            "WireGuard (wg_vortex)",
+            _fmt_bytes(wg["rx_bytes"]), _fmt_bytes(wg["tx_bytes"]),
+            str(wg["rx_packets"]), str(wg["tx_packets"]),
+            str(wg["rx_errors"] + wg["tx_errors"]),
+            str(wg["rx_dropped"] + wg["tx_dropped"]),
+        )
+    else:
+        table.add_row("WireGuard", "[dim]-[/]", "[dim]-[/]", "-", "-", "-", "-")
+
+    # Ports
+    for port, s in sorted(stats.get("ports", {}).items()):
+        table.add_row(
+            f"Port {port}",
+            _fmt_bytes(s["rx_bytes"]), _fmt_bytes(s["tx_bytes"]),
+            str(s.get("rx_packets", "-")), str(s.get("tx_packets", "-")),
+            "-", "-",
+        )
+
+    console.print(table)
+
+
+def show_performance_analysis(findings: list):
+    """Display bottleneck analysis results."""
+    table = Table(title="Performance Analysis", box=box.ROUNDED)
+    table.add_column("Status", width=8, justify="center")
+    table.add_column("Finding", style="white", width=42)
+    table.add_column("Recommendation", style="dim white", width=40)
+
+    severity_icons = {
+        "OK": "[green]✓ OK[/]",
+        "WARN": "[yellow]⚠ WARN[/]",
+        "CRIT": "[red]✗ CRIT[/]",
+    }
+
+    for severity, finding, recommendation in findings:
+        icon = severity_icons.get(severity, severity)
+        table.add_row(icon, finding, recommendation)
+
+    console.print(table)
+
+    # Summary counts
+    ok_count = sum(1 for s, _, _ in findings if s == "OK")
+    warn_count = sum(1 for s, _, _ in findings if s == "WARN")
+    crit_count = sum(1 for s, _, _ in findings if s == "CRIT")
+
+    summary = f"[green]{ok_count} OK[/]  [yellow]{warn_count} warnings[/]  [red]{crit_count} critical[/]"
+    console.print(f"\n  Summary: {summary}")
+
+    if crit_count > 0:
+        console.print("\n[bold red]  ⚠ Critical issues found that may impact performance![/]")
+    elif warn_count > 0:
+        console.print("\n[bold yellow]  Some optimizations available — see recommendations above.[/]")
+    else:
+        console.print("\n[bold green]  ✓ System is well-optimized. No bottlenecks detected.[/]")
+
+
+def show_optimization_preview(changes: list):
+    """Display TCP optimization preview table."""
+    table = Table(title="TCP Optimization Preview", box=box.ROUNDED)
+    table.add_column("Parameter", style="white", width=35)
+    table.add_column("Current", style="yellow", justify="right", width=20)
+    table.add_column("New Value", style="green", justify="right", width=20)
+
+    needs_change = 0
+    for param, current, new_val in changes:
+        if new_val == "(already set)":
+            table.add_row(param, current, "[dim]already set[/]")
+        else:
+            table.add_row(param, current, f"[bold green]{new_val}[/]")
+            needs_change += 1
+
+    console.print(table)
+    console.print(f"\n  [bold]{needs_change}[/] parameters will be changed, "
+                  f"[dim]{len(changes) - needs_change} already optimal[/]")
+
+
+def show_dns_instructions(instructions: list):
+    """Display DNS setup result and instructions."""
+    if not instructions:
+        return
+
+    text = "\n".join(instructions)
+    console.print(Panel(text, title="[bold white]DNS Cache Setup[/]",
+                        border_style="green", padding=(1, 2)))
+
+
+def show_dns_cache_status(status: dict):
+    """Display DNS cache status panel."""
+    from rich.table import Table
+
+    table = Table(show_header=False, box=box.SIMPLE, padding=(0, 2))
+    table.add_column("Key", style="bold white", width=22)
+    table.add_column("Value", style="white")
+
+    # Status
+    if status["running"]:
+        table.add_row("Status", f"[bold green]Running[/] ({status['server_type']})")
+    elif status["installed"]:
+        table.add_row("Status", "[bold yellow]Installed but not running[/]")
+    else:
+        table.add_row("Status", "[bold red]Not configured[/]")
+
+    # Config
+    if status["config_exists"]:
+        table.add_row("VortexL2 Config", "[green]Present[/]")
+    else:
+        table.add_row("VortexL2 Config", "[dim]Not found[/]")
+
+    # Role
+    role = status.get("role", "unknown")
+    if role == "iran":
+        table.add_row("Server Role", "[green]IRAN[/] (cache + forward through tunnel)")
+    elif role == "kharej":
+        table.add_row("Server Role", "[magenta]KHAREJ[/] (resolver for tunnel)")
+    else:
+        table.add_row("Server Role", "[dim]Unknown[/]")
+
+    # Listen addresses
+    if status["listen_addresses"]:
+        table.add_row("Listen Addresses", ", ".join(status["listen_addresses"]) + " :53")
+    else:
+        table.add_row("Listen Addresses", "[dim]—[/]")
+
+    # Upstream servers
+    if status["upstream_servers"]:
+        table.add_row("Upstream DNS", ", ".join(status["upstream_servers"]))
+    else:
+        table.add_row("Upstream DNS", "[dim]—[/]")
+
+    # Cache size
+    if status["cache_size"]:
+        table.add_row("Cache Size", f"{status['cache_size']} entries")
+    else:
+        table.add_row("Cache Size", "[dim]—[/]")
+
+    # Cache stats
+    cs = status.get("cache_stats")
+    if cs:
+        parts = []
+        if "hits" in cs:
+            parts.append(f"[green]{cs['hits']}[/] hits")
+        if "forwarded" in cs:
+            parts.append(f"[yellow]{cs['forwarded']}[/] forwarded")
+        if "used" in cs and "max" in cs:
+            parts.append(f"{cs['used']}/{cs['max']} cached")
+        if parts:
+            table.add_row("Cache Stats", " · ".join(parts))
+
+    console.print(Panel(table, title="[bold white]DNS Cache Status[/]",
+                        border_style="cyan"))
+
+
+def show_dns_submenu() -> str:
+    """Display DNS cache submenu."""
+    menu_items = [
+        ("1", "View DNS Cache Status"),
+        ("2", "Setup / Reconfigure DNS Cache"),
+        ("0", "Back"),
+    ]
+
+    table = Table(show_header=False, box=box.SIMPLE, padding=(0, 2))
+    table.add_column("Option", style="bold cyan", width=4)
+    table.add_column("Description", style="white")
+
+    for opt, desc in menu_items:
+        table.add_row(f"[{opt}]", desc)
+
+    console.print(table)
+    return Prompt.ask("\n[bold cyan]Select option[/]", default="0")
+
+
+def prompt_wireguard_side() -> Optional[str]:
+    """Prompt for WireGuard side (IRAN or KHAREJ)."""
+    console.print("\n[bold white]Select this server's role:[/]")
+    console.print("  [bold cyan][1][/] [green]IRAN[/]  (10.8.0.1)")
+    console.print("  [bold cyan][2][/] [magenta]KHAREJ[/] (10.8.0.2)")
+    console.print("  [bold cyan][0][/] Cancel")
+
+    choice = Prompt.ask("\n[bold cyan]Select side[/]", default="0")
+
+    if choice == "1":
+        return "IRAN"
+    elif choice == "2":
+        return "KHAREJ"
+    return None

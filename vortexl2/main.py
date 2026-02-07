@@ -18,6 +18,8 @@ from vortexl2 import __version__
 from vortexl2.config import TunnelConfig, ConfigManager, GlobalConfig
 from vortexl2.tunnel import TunnelManager
 from vortexl2.forward import get_forward_manager, get_forward_mode, set_forward_mode, ForwardManager
+from vortexl2.wireguard_manager import WireGuardManager
+from vortexl2 import bandwidth_monitor
 from vortexl2 import ui
 
 
@@ -87,6 +89,17 @@ def cmd_apply():
             errors += 1
             continue
     
+    # Bring up WireGuard on tunnels that have it enabled
+    for config in tunnels:
+        if config.wireguard_enabled and config.wireguard_peer_public_key:
+            wg = WireGuardManager(config)
+            if not wg.is_interface_up():
+                print(f"VortexL2: Bringing up WireGuard for tunnel '{config.name}'")
+                wg_ok, wg_msg = wg.enable(
+                    config, config.wireguard_side, config.wireguard_peer_public_key
+                )
+                print(f"  WireGuard: {wg_msg.splitlines()[-1] if wg_msg else 'unknown'}")
+
     print("VortexL2: Tunnel setup complete. Port forwarding managed by forward-daemon service")
     return 1 if errors > 0 else 0
 
@@ -403,13 +416,400 @@ def handle_forwards_menu(manager: ConfigManager):
             ui.wait_for_enter()
 
 
+def handle_wireguard_menu(manager: ConfigManager):
+    """Handle WireGuard encryption submenu."""
+    while True:
+        ui.show_banner()
+
+        # Show current WireGuard status summary
+        wg = WireGuardManager()
+        status = wg.get_status()
+        if status["interface_up"]:
+            ui.console.print("[bold green]WireGuard: ACTIVE[/]\n")
+        elif status["installed"]:
+            ui.console.print("[bold yellow]WireGuard: INSTALLED but INACTIVE[/]\n")
+        else:
+            ui.console.print("[bold red]WireGuard: NOT INSTALLED[/]\n")
+
+        choice = ui.show_wireguard_menu()
+
+        if choice == "0":
+            break
+        elif choice == "1":
+            # Install/Enable Secure Layer
+            _handle_wireguard_enable(manager)
+        elif choice == "2":
+            # Disable Secure Layer
+            _handle_wireguard_disable(manager)
+        elif choice == "3":
+            # View Status/Keys
+            ui.show_banner()
+            status = WireGuardManager.get_status()
+            ui.show_wireguard_status(status)
+            ui.wait_for_enter()
+        else:
+            ui.show_warning("Invalid option")
+            ui.wait_for_enter()
+
+
+def _handle_wireguard_enable(manager: ConfigManager):
+    """Handle enabling WireGuard encryption layer."""
+    ui.show_banner()
+    ui.console.print("[bold white]Enable Secure Encryption Layer (WireGuard)[/]\n")
+
+    # Step 1: Check/install wireguard-tools
+    wg = WireGuardManager()
+    if not wg.check_wireguard_installed():
+        ui.show_info("WireGuard is not installed. Installing...")
+        ok, msg = wg.install_wireguard()
+        ui.show_output(msg, "WireGuard Installation")
+        if not ok:
+            ui.show_error("WireGuard installation failed.")
+            ui.wait_for_enter()
+            return
+        ui.show_success("WireGuard installed")
+    else:
+        ui.show_success("WireGuard is already installed")
+
+    # Step 2: Generate keys (idempotent)
+    ok, msg = wg.generate_keys()
+    keys = wg.get_keys()
+    if not keys["public_key"]:
+        ui.show_error("Failed to generate WireGuard keys")
+        ui.wait_for_enter()
+        return
+
+    ui.console.print(f"\n[bold white]Your Public Key:[/] [bold green]{keys['public_key']}[/]")
+    ui.console.print("[dim]Share this key with the peer server.[/]\n")
+
+    # Step 3: Select tunnel
+    config = ui.prompt_select_tunnel_for_forwards(manager)
+    if not config:
+        ui.wait_for_enter()
+        return
+
+    # Step 4: Select side
+    side = ui.prompt_wireguard_side()
+    if not side:
+        ui.wait_for_enter()
+        return
+
+    # Step 5: Get peer public key
+    peer_key = ui.prompt_peer_public_key()
+    if not peer_key:
+        ui.wait_for_enter()
+        return
+
+    # Step 6: Enable WireGuard
+    ui.show_info("Enabling WireGuard encryption layer...")
+    ok, msg = wg.enable(config, side, peer_key)
+    ui.show_output(msg, "WireGuard Setup")
+
+    if ok:
+        # Update L2TP MTU to 1450 for WireGuard compatibility
+        ui.show_info(f"Updating L2TP MTU on {config.interface_name} to 1450...")
+        mtu_ok, mtu_msg = WireGuardManager.update_l2tp_mtu(config.interface_name)
+        if mtu_ok:
+            ui.show_success(mtu_msg)
+        else:
+            ui.show_warning(mtu_msg)
+
+        ui.show_success("WireGuard encryption layer is now ACTIVE!")
+        ui.console.print("\n[dim]Port forwards will now route through the encrypted WireGuard tunnel.[/]")
+    else:
+        ui.show_error("Failed to enable WireGuard encryption layer")
+
+    ui.wait_for_enter()
+
+
+def _handle_wireguard_disable(manager: ConfigManager):
+    """Handle disabling WireGuard encryption layer."""
+    ui.show_banner()
+
+    wg = WireGuardManager()
+    if not wg.is_interface_up():
+        ui.show_warning("WireGuard is not currently active")
+        ui.wait_for_enter()
+        return
+
+    if not ui.confirm("Disable WireGuard encryption layer?", default=False):
+        return
+
+    # Find tunnels with WireGuard enabled and update them
+    tunnels = manager.get_all_tunnels()
+    for config in tunnels:
+        if config.wireguard_enabled:
+            wg.disable(config)
+            ui.show_info(f"Disabled WireGuard for tunnel '{config.name}'")
+
+    # If no tunnel had it enabled, still tear down the interface
+    if not any(t.wireguard_enabled for t in tunnels):
+        wg.disable()
+
+    ui.show_success("WireGuard encryption layer disabled")
+    ui.wait_for_enter()
+
+
+def handle_bandwidth_menu(manager: ConfigManager):
+    """Handle bandwidth & performance monitor submenu."""
+    while True:
+        ui.show_banner()
+        choice = ui.show_bandwidth_menu()
+
+        if choice == "0":
+            break
+        elif choice == "1":
+            _handle_live_monitor(manager)
+        elif choice == "2":
+            _handle_snapshot(manager)
+        elif choice == "3":
+            _handle_performance_analysis(manager)
+        elif choice == "4":
+            _handle_auto_optimize(manager)
+        elif choice == "5":
+            _handle_dns_cache_setup(manager)
+        else:
+            ui.show_warning("Invalid option")
+            ui.wait_for_enter()
+
+
+def _handle_live_monitor(manager: ConfigManager):
+    """Run the live bandwidth monitor with Rich Live display."""
+    from rich.live import Live
+    import time
+
+    tunnels = manager.get_all_tunnels()
+    if not tunnels:
+        ui.show_warning("No tunnels configured. Create a tunnel first.")
+        ui.wait_for_enter()
+        return
+
+    # Setup iptables accounting for per-port monitoring
+    all_ports = []
+    for t in tunnels:
+        all_ports.extend(t.forwarded_ports)
+    if all_ports:
+        bandwidth_monitor.setup_port_accounting(all_ports)
+
+    ui.console.print("\n[bold yellow]Starting live monitor... Press Ctrl+C to stop.[/]\n")
+    time.sleep(0.5)
+
+    prev_stats = None
+    start_time = time.time()
+    interval = 1.0
+
+    try:
+        with Live(console=ui.console, refresh_per_second=1) as live:
+            while True:
+                current, bw = bandwidth_monitor.live_monitor_tick(
+                    tunnels, prev_stats, interval
+                )
+                elapsed = int(time.time() - start_time)
+                table = ui.show_bandwidth_live(bw, elapsed)
+                live.update(table)
+                prev_stats = current
+                time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
+
+    ui.console.print("\n[dim]Monitor stopped.[/]")
+    ui.wait_for_enter()
+
+
+def _handle_snapshot(manager: ConfigManager):
+    """Show a one-time snapshot of all layer statistics."""
+    ui.show_banner()
+
+    tunnels = manager.get_all_tunnels()
+    if not tunnels:
+        ui.show_warning("No tunnels configured.")
+        ui.wait_for_enter()
+        return
+
+    # Setup accounting
+    all_ports = []
+    for t in tunnels:
+        all_ports.extend(t.forwarded_ports)
+    if all_ports:
+        bandwidth_monitor.setup_port_accounting(all_ports)
+
+    stats = bandwidth_monitor.get_all_layer_stats(tunnels)
+    ui.show_snapshot(stats)
+    ui.wait_for_enter()
+
+
+def _handle_performance_analysis(manager: ConfigManager):
+    """Run bottleneck analysis and show recommendations."""
+    ui.show_banner()
+    ui.console.print("[bold white]Analyzing performance...[/]\n")
+
+    tunnels = manager.get_all_tunnels()
+    findings = bandwidth_monitor.analyze_bottleneck(tunnels)
+    ui.show_performance_analysis(findings)
+    ui.wait_for_enter()
+
+
+def _handle_auto_optimize(manager: ConfigManager):
+    """Preview and apply TCP/network optimizations."""
+    from rich.prompt import Confirm
+
+    ui.show_banner()
+    ui.console.print("[bold white]TCP & Network Auto-Optimizer[/]\n")
+
+    # Show preview
+    changes = bandwidth_monitor.get_optimization_preview()
+    ui.show_optimization_preview(changes)
+
+    needs_change = sum(1 for _, _, v in changes if v != "(already set)")
+    if needs_change == 0:
+        ui.console.print("\n[bold green]All parameters are already optimal![/]")
+        ui.wait_for_enter()
+        return
+
+    # Confirm
+    ui.console.print("")
+    if not Confirm.ask("[bold yellow]Apply these optimizations?[/]", default=True):
+        ui.show_info("Cancelled.")
+        ui.wait_for_enter()
+        return
+
+    # Apply
+    ok, msg = bandwidth_monitor.apply_tcp_optimizations()
+    if ok:
+        ui.show_success(msg)
+        ui.console.print("\n[bold white]Re-running analysis to verify...[/]\n")
+        tunnels = manager.get_all_tunnels()
+        findings = bandwidth_monitor.analyze_bottleneck(tunnels)
+        ui.show_performance_analysis(findings)
+    else:
+        ui.show_error(msg)
+
+    ui.wait_for_enter()
+
+
+def _handle_dns_cache_setup(manager: ConfigManager):
+    """DNS cache submenu — view status or setup/reconfigure."""
+    while True:
+        ui.show_banner()
+        ui.console.print("[bold white]DNS Cache[/]\n")
+
+        # Always show current status at the top
+        status = bandwidth_monitor.get_dns_cache_status()
+        ui.show_dns_cache_status(status)
+        ui.console.print("")
+
+        choice = ui.show_dns_submenu()
+
+        if choice == "0":
+            break
+        elif choice == "1":
+            # Already shown above, just wait
+            ui.wait_for_enter()
+        elif choice == "2":
+            _run_dns_setup(manager)
+        else:
+            ui.show_warning("Invalid option")
+            ui.wait_for_enter()
+
+
+def _run_dns_setup(manager: ConfigManager):
+    """Run the actual DNS cache setup flow."""
+    from rich.prompt import Confirm
+
+    ui.show_banner()
+    ui.console.print("[bold white]DNS Cache Setup[/]\n")
+
+    # Detect side from tunnel configs
+    tunnels = manager.get_all_tunnels()
+    side = None
+    wireguard_ip = None
+    wireguard_peer_ip = None
+
+    for t in tunnels:
+        wg_side = getattr(t, 'wireguard_side', None)
+        if wg_side:
+            side = wg_side
+            # Strip CIDR notation (e.g. 10.8.0.2/24 -> 10.8.0.2)
+            raw_ip = getattr(t, 'wireguard_ip', None)
+            wireguard_ip = raw_ip.split('/')[0] if raw_ip else None
+            wireguard_peer_ip = getattr(t, 'wireguard_peer_ip', None)
+            break
+
+    if not side:
+        # Ask the user
+        ui.console.print("[yellow]Could not detect server role from tunnel config.[/]")
+        ui.console.print("[bold white]Which server is this?[/]")
+        ui.console.print("  [bold cyan][1][/] [green]IRAN[/]  (clients connect here, forwards to Kharej)")
+        ui.console.print("  [bold cyan][2][/] [magenta]KHAREJ[/] (runs V2Ray/services, has internet access)")
+        ui.console.print("  [bold cyan][0][/] Cancel")
+        choice = ui.Prompt.ask("\n[bold cyan]Select[/]", default="0")
+        if choice == "1":
+            side = "IRAN"
+            wireguard_peer_ip = "10.8.0.2"
+        elif choice == "2":
+            side = "KHAREJ"
+            wireguard_ip = "10.8.0.2"
+        else:
+            return
+
+    if side == "IRAN":
+        peer_ip = wireguard_peer_ip or "10.8.0.2"
+        ui.console.print(f"[bold green]IRAN server[/] — Setting up DNS cache")
+        ui.console.print(f"  Cache misses will forward to [cyan]{peer_ip}:53[/] (through tunnel)")
+        ui.console.print("")
+
+        if not Confirm.ask("[bold yellow]Install and configure dnsmasq?[/]", default=True):
+            ui.show_info("Cancelled.")
+            ui.wait_for_enter()
+            return
+
+        ok, msg, instructions = bandwidth_monitor.setup_dns_cache_iran(peer_ip)
+
+    elif side == "KHAREJ":
+        wg_ip = wireguard_ip or "10.8.0.2"
+        ui.console.print(f"[bold magenta]KHAREJ server[/] — Setting up DNS resolver")
+        ui.console.print(f"  Will listen on [cyan]{wg_ip}:53[/] (tunnel-only, not public)")
+
+        # Check for existing DNS server
+        existing = bandwidth_monitor.detect_existing_dns()
+        if existing and existing["name"] not in ("systemd-resolved", "dnsmasq"):
+            ui.console.print(f"\n[bold yellow]Detected: {existing['name']} on port 53[/]")
+            if Confirm.ask(f"[bold]Use {existing['name']} as the resolver? (just print config instructions)[/]",
+                           default=True):
+                ok, msg, instructions = bandwidth_monitor.setup_dns_cache_kharej(wg_ip)
+            else:
+                ui.show_info("Cancelled.")
+                ui.wait_for_enter()
+                return
+        else:
+            ui.console.print("")
+            if not Confirm.ask("[bold yellow]Install and configure dnsmasq?[/]", default=True):
+                ui.show_info("Cancelled.")
+                ui.wait_for_enter()
+                return
+            ok, msg, instructions = bandwidth_monitor.setup_dns_cache_kharej(wg_ip)
+    else:
+        ui.show_error(f"Unknown side: {side}")
+        ui.wait_for_enter()
+        return
+
+    if ok:
+        ui.show_success(msg)
+        ui.show_dns_instructions(instructions)
+    else:
+        ui.show_error(msg)
+
+    ui.wait_for_enter()
+
+
 def handle_logs(manager: ConfigManager):
     """Handle log viewing."""
     ui.show_banner()
     
     services = [
         "vortexl2-tunnel.service",
-        "vortexl2-forward-daemon.service"
+        "vortexl2-forward-daemon.service",
+        "vortexl2-wireguard.service",
     ]
     
     for service in services:
@@ -457,6 +857,10 @@ def main_menu():
             elif choice == "5":
                 handle_forwards_menu(manager)
             elif choice == "6":
+                handle_wireguard_menu(manager)
+            elif choice == "7":
+                handle_bandwidth_menu(manager)
+            elif choice == "8":
                 handle_logs(manager)
             else:
                 ui.show_warning("Invalid option")

@@ -17,7 +17,7 @@ VortexL2 v2.0 uses **HAProxy** for production-grade, high-performance port forwa
 HAProxy is automatically installed by the VortexL2 installer:
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/iliya-Developer/VortexL2/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/mrsase/VortexL2/main/install.sh)
 ```
 
 Or manually:

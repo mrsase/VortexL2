@@ -3,7 +3,11 @@
 # VortexL2 Installer
 # L2TPv3 Tunnel Manager for Ubuntu/Debian
 #
-# Usage: curl -fsSL https://raw.githubusercontent.com/iliya-Developer/VortexL2/main/install.sh | sudo bash
+# Usage (Kharej / direct internet):
+#   bash <(curl -fsSL https://raw.githubusercontent.com/mrsase/VortexL2/main/install.sh)
+#
+# Usage (Iran / behind firewall — will be prompted for proxy):
+#   bash <(curl -x socks5h://127.0.0.1:<PORT> -Ls https://raw.githubusercontent.com/mrsase/VortexL2/main/install.sh)
 #
 
 set -e
@@ -20,8 +24,11 @@ INSTALL_DIR="/opt/vortexl2"
 BIN_PATH="/usr/local/bin/vortexl2"
 SYSTEMD_DIR="/etc/systemd/system"
 CONFIG_DIR="/etc/vortexl2"
-REPO_URL="https://github.com/iliya-Developer/VortexL2.git"
+REPO_URL="https://github.com/mrsase/VortexL2.git"
 REPO_BRANCH="main"
+PROXY_URL=""
+GIT_PROXY_FLAG=""
+CURL_PROXY_FLAG=""
 
 echo -e "${CYAN}"
 cat << 'EOF'
@@ -49,10 +56,56 @@ if ! command -v apt-get &> /dev/null; then
     exit 1
 fi
 
+# ── Ask server role BEFORE any network operations ──
+echo -e "${CYAN}Which server are you installing on?${NC}"
+echo -e "  ${GREEN}[1]${NC} IRAN   (behind firewall — needs proxy for downloads)"
+echo -e "  ${GREEN}[2]${NC} KHAREJ (direct internet access)"
+echo ""
+read -r -p "Select [1/2]: " SERVER_ROLE
+
+case "$SERVER_ROLE" in
+    1)
+        echo ""
+        echo -e "${YELLOW}Iran server selected — a SOCKS5 proxy is required to download packages.${NC}"
+        echo -e "${CYAN}This is typically your tunnel proxy (e.g. V2Ray, Xray) running locally.${NC}"
+        echo ""
+        read -r -p "Enter SOCKS5 proxy port on 127.0.0.1 [default: 1080]: " PROXY_PORT
+        PROXY_PORT="${PROXY_PORT:-1080}"
+
+        PROXY_URL="socks5h://127.0.0.1:${PROXY_PORT}"
+        GIT_PROXY_FLAG="-c http.proxy=${PROXY_URL}"
+        CURL_PROXY_FLAG="-x ${PROXY_URL}"
+
+        # Set system-wide proxy for this install session (apt, pip, curl, etc.)
+        export http_proxy="${PROXY_URL}"
+        export https_proxy="${PROXY_URL}"
+        export ALL_PROXY="${PROXY_URL}"
+
+        # Verify proxy is reachable before continuing
+        echo -e "${YELLOW}Verifying proxy at ${PROXY_URL}...${NC}"
+        if curl ${CURL_PROXY_FLAG} -fsSL --connect-timeout 5 -o /dev/null "https://github.com" 2>/dev/null; then
+            echo -e "${GREEN}  ✓ Proxy is working${NC}"
+        else
+            echo -e "${RED}  ✗ Cannot reach GitHub through proxy at 127.0.0.1:${PROXY_PORT}${NC}"
+            echo -e "${YELLOW}  Make sure your tunnel/proxy is running and try again.${NC}"
+            exit 1
+        fi
+        echo ""
+        ;;
+    2)
+        echo -e "${GREEN}Kharej server — using direct connection.${NC}"
+        echo ""
+        ;;
+    *)
+        echo -e "${RED}Invalid selection. Exiting.${NC}"
+        exit 1
+        ;;
+esac
+
 echo -e "${YELLOW}[1/6] Installing system dependencies...${NC}"
 apt-get update -qq
 # Install haproxy for high-performance port forwarding (not auto-started)
-apt-get install -y -qq python3 python3-pip python3-venv git iproute2 haproxy
+apt-get install -y -qq python3 python3-pip python3-venv git iproute2 haproxy wireguard-tools
 
 # Install kernel modules package
 KERNEL_VERSION=$(uname -r)
@@ -83,16 +136,18 @@ fi
 
 # Clone or download repository
 if command -v git &> /dev/null; then
-    git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR" 2>/dev/null || {
+    # shellcheck disable=SC2086
+    git ${GIT_PROXY_FLAG} clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR" 2>/dev/null || {
         echo -e "${YELLOW}Git clone failed, trying manual download...${NC}"
         mkdir -p "$INSTALL_DIR"
-        # If git fails, try downloading as archive
-        curl -fsSL "https://github.com/iliya-Developer/VortexL2/archive/refs/heads/${REPO_BRANCH}.tar.gz" | \
+        # shellcheck disable=SC2086
+        curl ${CURL_PROXY_FLAG} -fsSL "https://github.com/mrsase/VortexL2/archive/refs/heads/${REPO_BRANCH}.tar.gz" | \
             tar -xz -C "$INSTALL_DIR" --strip-components=1
     }
 else
     mkdir -p "$INSTALL_DIR"
-    curl -fsSL "https://github.com/iliya-Developer/VortexL2/archive/refs/heads/${REPO_BRANCH}.tar.gz" | \
+    # shellcheck disable=SC2086
+    curl ${CURL_PROXY_FLAG} -fsSL "https://github.com/mrsase/VortexL2/archive/refs/heads/${REPO_BRANCH}.tar.gz" | \
         tar -xz -C "$INSTALL_DIR" --strip-components=1
 fi
 
@@ -121,6 +176,7 @@ chmod +x "$BIN_PATH"
 echo -e "${YELLOW}[6/6] Installing systemd services...${NC}"
 cp "$INSTALL_DIR/systemd/vortexl2-tunnel.service" "$SYSTEMD_DIR/"
 cp "$INSTALL_DIR/systemd/vortexl2-forward-daemon.service" "$SYSTEMD_DIR/"
+cp "$INSTALL_DIR/systemd/vortexl2-wireguard.service" "$SYSTEMD_DIR/"
 
 # Create config directories
 mkdir -p "$CONFIG_DIR"
@@ -128,11 +184,13 @@ mkdir -p "$CONFIG_DIR/tunnels"
 mkdir -p /var/lib/vortexl2
 mkdir -p /var/log/vortexl2
 mkdir -p /etc/vortexl2/haproxy
+mkdir -p /etc/vortex/wg
 chmod 700 "$CONFIG_DIR"
 chmod 755 /var/lib/vortexl2
 chmod 755 /var/log/vortexl2
 chown root:root /etc/vortexl2/haproxy || true
 chmod 755 /etc/vortexl2/haproxy || true
+chmod 700 /etc/vortex/wg
 
 # Reload systemd
 systemctl daemon-reload
@@ -198,7 +256,7 @@ echo ""
 echo -e "${CYAN}For Iran side port forwarding:${NC}"
 echo -e "  Use menu option 5 to add ports like: 443,80,2053"
 echo ""
-echo -e "${RED}Security Note:${NC}"
-echo -e "  L2TPv3 has NO encryption. For sensitive traffic,"
-echo -e "  consider adding IPsec or WireGuard on top."
+echo -e "${CYAN}Encryption:${NC}"
+echo -e "  Use menu option 6 to enable WireGuard encryption layer"
+echo -e "  This adds kernel-level encryption inside the L2TP tunnel"
 echo ""

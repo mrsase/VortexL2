@@ -26,8 +26,14 @@ A modular, production-quality CLI tool for managing multiple L2TPv3 tunnels with
 ## 📦 Quick Install
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/iliya-Developer/VortexL2/main/install.sh)
+# Kharej (direct internet):
+bash <(curl -fsSL https://raw.githubusercontent.com/mrsase/VortexL2/main/install.sh)
+
+# Iran (behind firewall — replace PORT with your local proxy port):
+bash <(curl -x socks5h://127.0.0.1:PORT -Ls https://raw.githubusercontent.com/mrsase/VortexL2/main/install.sh)
 ```
+
+The installer will ask which server you're installing on and configure proxy settings automatically.
 
 ## 🚀 First Run
 
