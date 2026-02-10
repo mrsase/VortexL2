@@ -452,6 +452,23 @@ def handle_wireguard_menu(manager: ConfigManager):
             ui.wait_for_enter()
 
 
+def _reload_haproxy_after_wg_change():
+    """Regenerate and reload HAProxy config after WireGuard enable/disable.
+
+    This ensures port forwards point to the correct backend IP
+    (WireGuard peer IP when encrypted, L2TP IP when direct).
+    """
+    from vortexl2.forward import get_forward_mode
+    if get_forward_mode() in ("haproxy", "socat"):
+        from vortexl2.haproxy_manager import HAProxyManager
+        mgr = HAProxyManager(None)
+        ok, msg = mgr.validate_and_reload()
+        if ok:
+            ui.show_success("Port forwards updated to use new routing path")
+        else:
+            ui.show_warning(f"Could not reload port forwards: {msg}")
+
+
 def _handle_wireguard_enable(manager: ConfigManager):
     """Handle enabling WireGuard encryption layer."""
     ui.show_banner()
@@ -515,6 +532,10 @@ def _handle_wireguard_enable(manager: ConfigManager):
             ui.show_warning(mtu_msg)
 
         ui.show_success("WireGuard encryption layer is now ACTIVE!")
+
+        # Regenerate HAProxy config so port forwards route through WireGuard IP
+        _reload_haproxy_after_wg_change()
+
         ui.console.print("\n[dim]Port forwards will now route through the encrypted WireGuard tunnel.[/]")
     else:
         ui.show_error("Failed to enable WireGuard encryption layer")
@@ -547,6 +568,10 @@ def _handle_wireguard_disable(manager: ConfigManager):
         wg.disable()
 
     ui.show_success("WireGuard encryption layer disabled")
+
+    # Regenerate HAProxy config so port forwards revert to L2TP IP
+    _reload_haproxy_after_wg_change()
+
     ui.wait_for_enter()
 
 
@@ -568,6 +593,8 @@ def handle_bandwidth_menu(manager: ConfigManager):
             _handle_auto_optimize(manager)
         elif choice == "5":
             _handle_dns_cache_setup(manager)
+        elif choice == "6":
+            _handle_mtu_finder(manager)
         else:
             ui.show_warning("Invalid option")
             ui.wait_for_enter()
@@ -683,6 +710,138 @@ def _handle_auto_optimize(manager: ConfigManager):
         ui.show_performance_analysis(findings)
     else:
         ui.show_error(msg)
+
+    ui.wait_for_enter()
+
+
+def _handle_mtu_finder(manager: ConfigManager):
+    """Run MTU discovery and optionally apply optimal settings."""
+    from rich.prompt import Confirm, Prompt
+    from vortexl2 import mtu_finder
+
+    ui.show_banner()
+    ui.console.print("[bold white]MTU Finder & Auto-Configure[/]\n")
+
+    tunnels = manager.get_all_tunnels()
+    if not tunnels:
+        ui.show_warning("No tunnels configured. Create a tunnel first.")
+        ui.wait_for_enter()
+        return
+
+    # Detect tunnel properties for correct overhead calculation
+    tunnel = tunnels[0]
+    encap_type = getattr(tunnel, 'encap_type', 'udp')
+    wg_enabled = getattr(tunnel, 'wireguard_enabled', False)
+
+    # Show current MTU values
+    ui.console.print("[bold white]Current MTU settings:[/]")
+    l2tp_iface = tunnel.interface_name
+    cur_l2tp = mtu_finder.get_current_mtu(l2tp_iface)
+    if cur_l2tp:
+        ui.console.print(f"  {l2tp_iface}: [cyan]{cur_l2tp}[/]")
+    cur_wg = mtu_finder.get_current_mtu("wg_vortex")
+    if cur_wg:
+        ui.console.print(f"  wg_vortex: [cyan]{cur_wg}[/]")
+    ui.console.print(f"  Encapsulation: [cyan]{encap_type.upper()}[/]")
+    ui.console.print(f"  WireGuard: [cyan]{'Enabled' if wg_enabled else 'Disabled'}[/]")
+    ui.console.print("")
+
+    # Ask mode
+    ui.console.print("[bold white]Select discovery mode:[/]")
+    ui.console.print("  [bold cyan][1][/] Auto-detect (test foreign targets)")
+    ui.console.print("  [bold cyan][2][/] Iran mode (test foreign + domestic routes)")
+    ui.console.print("  [bold cyan][3][/] Manual (enter specific IP to test)")
+    ui.console.print("  [bold cyan][0][/] Cancel")
+    mode = Prompt.ask("\n[bold cyan]Select[/]", default="1")
+
+    if mode == "0":
+        return
+
+    target = None
+    use_iran = False
+
+    if mode == "2":
+        use_iran = True
+    elif mode == "3":
+        target = Prompt.ask("[bold cyan]Enter target IP[/]", default="8.8.8.8")
+
+    # Run discovery with progress display
+    ui.console.print("\n[bold yellow]Starting MTU discovery... this may take 1-3 minutes.[/]\n")
+
+    last_phase = [None]
+
+    def progress_cb(phase, pct, msg):
+        phase_labels = {
+            "binary": "Phase 1: Binary Search",
+            "stability": "Phase 2: Stability Test",
+            "target": "Finding target",
+        }
+        label = phase_labels.get(phase, phase)
+        if phase != last_phase[0]:
+            if last_phase[0] is not None:
+                ui.console.print("")  # newline between phases
+            ui.console.print(f"[bold cyan]{label}[/]")
+            last_phase[0] = phase
+        # Print progress inline
+        filled = int(30 * pct / 100)
+        bar = "█" * filled + "░" * (30 - filled)
+        ui.console.print(f"\r  [{bar}] {pct:3d}% {msg}  ", end="")
+
+    try:
+        rec = mtu_finder.discover_mtu(
+            target=target,
+            use_iran_mode=use_iran,
+            conservative=True,
+            progress_cb=progress_cb,
+        )
+    except KeyboardInterrupt:
+        ui.console.print("\n\n[yellow]Aborted by user.[/]")
+        ui.wait_for_enter()
+        return
+
+    ui.console.print("\n")  # clear progress line
+
+    if not rec:
+        ui.show_error("Could not determine stable MTU. Check network connectivity and ICMP access.")
+        ui.wait_for_enter()
+        return
+
+    # Recompute with actual tunnel parameters
+    rec = mtu_finder.compute_recommendation(
+        rec.physical_mtu, rec.test_result,
+        encap_type=encap_type,
+        wireguard_enabled=wg_enabled,
+    )
+
+    # Display recommendation
+    ui.show_mtu_recommendation(rec)
+
+    # Show protocol table
+    ui.console.print("")
+    proto_rows = mtu_finder.get_protocol_table(rec.physical_mtu)
+    ui.show_mtu_protocol_table(proto_rows)
+
+    # Ask to apply
+    ui.console.print("")
+    if not Confirm.ask("[bold yellow]Apply these MTU/MSS settings now?[/]", default=True):
+        ui.show_info("Settings not applied. You can apply them manually.")
+        ui.wait_for_enter()
+        return
+
+    # Apply
+    ui.console.print("\n[bold white]Applying settings...[/]\n")
+    results = mtu_finder.apply_mtu(
+        rec,
+        l2tp_interface=l2tp_iface,
+        wg_interface="wg_vortex",
+    )
+    ui.show_mtu_apply_results(results)
+
+    all_ok = all(ok for _, ok, _ in results)
+    if all_ok:
+        ui.show_success("All MTU/MSS settings applied successfully!")
+    else:
+        ui.show_warning("Some settings could not be applied — see details above.")
 
     ui.wait_for_enter()
 
