@@ -712,7 +712,7 @@ def show_bandwidth_menu() -> str:
         ("3", "Performance Analysis (bottleneck detection)"),
         ("4", "Auto-Optimize (apply TCP/network fixes)"),
         ("5", "Setup DNS Cache"),
-        ("6", "MTU Finder & Auto-Configure"),
+        ("6", "MTU & MSS Configuration"),
         ("0", "Back to Main Menu"),
     ]
 
@@ -907,55 +907,6 @@ def show_dns_instructions(instructions: list):
     text = "\n".join(instructions)
     console.print(Panel(text, title="[bold white]DNS Cache Setup[/]",
                         border_style="green", padding=(1, 2)))
-
-
-def show_mtu_recommendation(rec) -> None:
-    """Display MTU recommendation table."""
-    from rich.table import Table as RichTable
-
-    table = RichTable(show_header=False, box=box.SIMPLE, padding=(0, 2))
-    table.add_column("Key", style="bold white", width=24)
-    table.add_column("Value", style="white")
-
-    table.add_row("Physical MTU (stable)", f"[bold green]{rec.physical_mtu}[/]")
-    table.add_row("L2TP Interface MTU", f"[cyan]{rec.l2tp_mtu}[/]")
-    if rec.wireguard_mtu > 0:
-        table.add_row("WireGuard MTU", f"[cyan]{rec.wireguard_mtu}[/]")
-    table.add_row("TCP MSS Clamp", f"[cyan]{rec.tcp_mss}[/]")
-
-    if rec.test_result:
-        table.add_row("Reliability", f"[green]{rec.test_result.success_rate:.1f}%[/]")
-        table.add_row(
-            "Latency",
-            f"{rec.test_result.avg_latency:.1f}ms "
-            f"(±{rec.test_result.jitter:.1f}ms, max {rec.test_result.max_latency:.1f}ms)",
-        )
-
-    console.print(Panel(table, title="[bold white]MTU Recommendation[/]",
-                        border_style="green"))
-
-
-def show_mtu_protocol_table(rows: list) -> None:
-    """Display the full protocol overhead table."""
-    from rich.table import Table as RichTable
-
-    table = RichTable(title="Protocol MTU Table", box=box.ROUNDED)
-    table.add_column("Protocol", style="white", width=30)
-    table.add_column("Overhead", style="dim", justify="right", width=10)
-    table.add_column("MTU", justify="right", width=8)
-    table.add_column("MSS", justify="right", width=8)
-
-    for row in rows:
-        mtu = row["mtu"]
-        color = "green" if mtu >= 1280 else "yellow"
-        table.add_row(
-            row["protocol"],
-            str(row["overhead"]),
-            f"[{color}]{mtu}[/]",
-            str(row["mss"]),
-        )
-
-    console.print(table)
 
 
 def show_mtu_apply_results(results: list) -> None:

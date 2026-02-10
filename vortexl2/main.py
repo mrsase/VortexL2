@@ -715,12 +715,12 @@ def _handle_auto_optimize(manager: ConfigManager):
 
 
 def _handle_mtu_finder(manager: ConfigManager):
-    """Run MTU discovery and optionally apply optimal settings."""
+    """Manual MTU/MSS configuration — user enters values, we apply them."""
     from rich.prompt import Confirm, Prompt
     from vortexl2 import mtu_finder
 
     ui.show_banner()
-    ui.console.print("[bold white]MTU Finder & Auto-Configure[/]\n")
+    ui.console.print("[bold white]MTU & MSS Configuration[/]\n")
 
     tunnels = manager.get_all_tunnels()
     if not tunnels:
@@ -728,110 +728,99 @@ def _handle_mtu_finder(manager: ConfigManager):
         ui.wait_for_enter()
         return
 
-    # Detect tunnel properties for correct overhead calculation
     tunnel = tunnels[0]
-    encap_type = getattr(tunnel, 'encap_type', 'udp')
     wg_enabled = getattr(tunnel, 'wireguard_enabled', False)
-
-    # Show current MTU values
-    ui.console.print("[bold white]Current MTU settings:[/]")
     l2tp_iface = tunnel.interface_name
+
+    # Show current values
+    ui.console.print("[bold white]Current settings:[/]")
     cur_l2tp = mtu_finder.get_current_mtu(l2tp_iface)
     if cur_l2tp:
-        ui.console.print(f"  {l2tp_iface}: [cyan]{cur_l2tp}[/]")
+        ui.console.print(f"  {l2tp_iface} MTU: [cyan]{cur_l2tp}[/]")
+    else:
+        ui.console.print(f"  {l2tp_iface} MTU: [dim]not available[/]")
     cur_wg = mtu_finder.get_current_mtu("wg_vortex")
-    if cur_wg:
-        ui.console.print(f"  wg_vortex: [cyan]{cur_wg}[/]")
-    ui.console.print(f"  Encapsulation: [cyan]{encap_type.upper()}[/]")
+    if wg_enabled and cur_wg:
+        ui.console.print(f"  wg_vortex MTU: [cyan]{cur_wg}[/]")
+    elif wg_enabled:
+        ui.console.print(f"  wg_vortex MTU: [dim]not available[/]")
     ui.console.print(f"  WireGuard: [cyan]{'Enabled' if wg_enabled else 'Disabled'}[/]")
     ui.console.print("")
 
-    # Ask mode
-    ui.console.print("[bold white]Select discovery mode:[/]")
-    ui.console.print("  [bold cyan][1][/] Auto-detect (test foreign targets)")
-    ui.console.print("  [bold cyan][2][/] Iran mode (test foreign + domestic routes)")
-    ui.console.print("  [bold cyan][3][/] Manual (enter specific IP to test)")
-    ui.console.print("  [bold cyan][0][/] Cancel")
-    mode = Prompt.ask("\n[bold cyan]Select[/]", default="1")
+    ui.console.print("[dim]Run mtu-finder.py on your server to discover optimal values.[/]\n")
 
-    if mode == "0":
-        return
-
-    target = None
-    use_iran = False
-
-    if mode == "2":
-        use_iran = True
-    elif mode == "3":
-        target = Prompt.ask("[bold cyan]Enter target IP[/]", default="8.8.8.8")
-
-    # Run discovery with progress display
-    ui.console.print("\n[bold yellow]Starting MTU discovery... this may take 1-3 minutes.[/]\n")
-
-    last_phase = [None]
-
-    def progress_cb(phase, pct, msg):
-        phase_labels = {
-            "binary": "Phase 1: Binary Search",
-            "stability": "Phase 2: Stability Test",
-            "target": "Finding target",
-        }
-        label = phase_labels.get(phase, phase)
-        if phase != last_phase[0]:
-            if last_phase[0] is not None:
-                ui.console.print("")  # newline between phases
-            ui.console.print(f"[bold cyan]{label}[/]")
-            last_phase[0] = phase
-        # Print progress inline
-        filled = int(30 * pct / 100)
-        bar = "█" * filled + "░" * (30 - filled)
-        ui.console.print(f"\r  [{bar}] {pct:3d}% {msg}  ", end="")
-
-    try:
-        rec = mtu_finder.discover_mtu(
-            target=target,
-            use_iran_mode=use_iran,
-            conservative=True,
-            progress_cb=progress_cb,
-        )
-    except KeyboardInterrupt:
-        ui.console.print("\n\n[yellow]Aborted by user.[/]")
-        ui.wait_for_enter()
-        return
-
-    ui.console.print("\n")  # clear progress line
-
-    if not rec:
-        ui.show_error("Could not determine stable MTU. Check network connectivity and ICMP access.")
-        ui.wait_for_enter()
-        return
-
-    # Recompute with actual tunnel parameters
-    rec = mtu_finder.compute_recommendation(
-        rec.physical_mtu, rec.test_result,
-        encap_type=encap_type,
-        wireguard_enabled=wg_enabled,
+    # Prompt for L2TP MTU
+    l2tp_mtu_str = Prompt.ask(
+        f"[bold cyan]Enter L2TP MTU for {l2tp_iface}[/]",
+        default=str(cur_l2tp) if cur_l2tp else "1450",
     )
+    try:
+        l2tp_mtu = int(l2tp_mtu_str)
+        if not (1280 <= l2tp_mtu <= 9000):
+            ui.show_error("MTU must be between 1280 and 9000.")
+            ui.wait_for_enter()
+            return
+    except ValueError:
+        ui.show_error("Invalid number.")
+        ui.wait_for_enter()
+        return
 
-    # Display recommendation
-    ui.show_mtu_recommendation(rec)
+    # Prompt for WireGuard MTU (if enabled)
+    wg_mtu = 0
+    if wg_enabled:
+        wg_mtu_str = Prompt.ask(
+            "[bold cyan]Enter WireGuard MTU for wg_vortex[/]",
+            default=str(cur_wg) if cur_wg else "1380",
+        )
+        try:
+            wg_mtu = int(wg_mtu_str)
+            if not (1280 <= wg_mtu <= 9000):
+                ui.show_error("MTU must be between 1280 and 9000.")
+                ui.wait_for_enter()
+                return
+        except ValueError:
+            ui.show_error("Invalid number.")
+            ui.wait_for_enter()
+            return
 
-    # Show protocol table
+    # Prompt for TCP MSS
+    inner_mtu = wg_mtu if wg_enabled else l2tp_mtu
+    default_mss = inner_mtu - 40  # subtract TCP/IP headers
+    mss_str = Prompt.ask(
+        "[bold cyan]Enter TCP MSS[/]",
+        default=str(default_mss),
+    )
+    try:
+        tcp_mss = int(mss_str)
+        if not (500 <= tcp_mss <= 9000):
+            ui.show_error("MSS must be between 500 and 9000.")
+            ui.wait_for_enter()
+            return
+    except ValueError:
+        ui.show_error("Invalid number.")
+        ui.wait_for_enter()
+        return
+
+    # Confirm
     ui.console.print("")
-    proto_rows = mtu_finder.get_protocol_table(rec.physical_mtu)
-    ui.show_mtu_protocol_table(proto_rows)
-
-    # Ask to apply
+    ui.console.print("[bold white]Will apply:[/]")
+    ui.console.print(f"  {l2tp_iface} MTU → [green]{l2tp_mtu}[/]")
+    if wg_enabled:
+        ui.console.print(f"  wg_vortex MTU → [green]{wg_mtu}[/]")
+    ui.console.print(f"  TCP MSS clamp → [green]{tcp_mss}[/]")
     ui.console.print("")
-    if not Confirm.ask("[bold yellow]Apply these MTU/MSS settings now?[/]", default=True):
-        ui.show_info("Settings not applied. You can apply them manually.")
+
+    if not Confirm.ask("[bold yellow]Apply these settings?[/]", default=True):
+        ui.show_info("Cancelled.")
         ui.wait_for_enter()
         return
 
     # Apply
-    ui.console.print("\n[bold white]Applying settings...[/]\n")
-    results = mtu_finder.apply_mtu(
-        rec,
+    ui.console.print("\n[bold white]Applying...[/]\n")
+    results = mtu_finder.apply_mtu_mss(
+        l2tp_mtu=l2tp_mtu,
+        wg_mtu=wg_mtu,
+        tcp_mss=tcp_mss,
         l2tp_interface=l2tp_iface,
         wg_interface="wg_vortex",
     )
